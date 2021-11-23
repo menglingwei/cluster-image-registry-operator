@@ -4,19 +4,25 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	"os"
 	"reflect"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/klog/v2"
 
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/credentials"
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/credentials/provider"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 
 	configv1 "github.com/openshift/api/config/v1"
 	imageregistryv1 "github.com/openshift/api/imageregistry/v1"
 	operatorapi "github.com/openshift/api/operator/v1"
 
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth"
 	regopclient "github.com/openshift/cluster-image-registry-operator/pkg/client"
 	"github.com/openshift/cluster-image-registry-operator/pkg/defaults"
 	"github.com/openshift/cluster-image-registry-operator/pkg/envvar"
@@ -39,6 +45,8 @@ const (
 	envRegistryStorageOssAccessKeySecret = "REGISTRY_STORAGE_OSS_ACCESSKEYSECRET"
 )
 
+var mutex sync.Mutex
+
 type AlibabaCloudCredentials struct {
 	accessKeyID     string
 	accessKeySecret string
@@ -48,7 +56,7 @@ type driver struct {
 	Context     context.Context
 	Config      *imageregistryv1.ImageRegistryConfigStorageOSS
 	Listers     *regopclient.Listers
-	credentials *AlibabaCloudCredentials
+	credentials *credentials.AccessKeyCredential
 
 	// roundTripper is used only during tests.
 	roundTripper http.RoundTripper
@@ -99,6 +107,32 @@ func (d *driver) UpdateEffectiveConfig() error {
 	return nil
 }
 
+func fetchCredentialsIniFromSecret(secret *corev1.Secret) (auth.Credential, error) {
+	mutex.Lock()
+	defer mutex.Unlock()
+	creds, ok := secret.Data[imageRegistrySecretDataKey]
+	if !ok {
+		return nil, fmt.Errorf("failed to fetch key 'credentials' in secret data")
+	}
+
+	f, err := ioutil.TempFile("", "alibaba-creds-*")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	defer os.Remove(f.Name())
+	defer os.Unsetenv(provider.ENVCredentialFile)
+	_, err = f.Write(creds)
+	if err != nil {
+		return nil, err
+	}
+	os.Setenv(provider.ENVCredentialFile, f.Name())
+	// use Alibaba provider initialization
+	p := provider.NewProfileProvider("default")
+	// return a valid auth credential
+	return p.Resolve()
+}
+
 func (d *driver) getCredentialsConfigData() error {
 	if d.credentials != nil {
 		return nil
@@ -112,35 +146,19 @@ func (d *driver) getCredentialsConfigData() error {
 		if err != nil {
 			return fmt.Errorf("unable to get cluster minted credentials %q: %v", fmt.Sprintf("%s/%s", defaults.ImageRegistryOperatorNamespace, defaults.CloudCredentialsName), err)
 		}
-
-		credentials, err := sharedCredentialsDataFromSecret(sec)
-		if err != nil {
-			return fmt.Errorf("failed to generate shared secrets data: %v", err)
-		}
-		d.credentials = credentials
-		return nil
-	} else if err != nil {
-		return err
-	} else {
-		var accessKeyID, accessKeySecret string
-		if v, ok := sec.Data[envRegistryStorageOssAccessKeyId]; ok {
-			accessKeyID = string(v)
-		} else {
-			return fmt.Errorf("secret %q does not contain required key \"%q\"", fmt.Sprintf("%s/%s", defaults.ImageRegistryOperatorNamespace, defaults.ImageRegistryPrivateConfigurationUser), envRegistryStorageOssAccessKeyId)
-		}
-		if v, ok := sec.Data[envRegistryStorageOssAccessKeySecret]; ok {
-			accessKeySecret = string(v)
-		} else {
-			return fmt.Errorf("secret %q does not contain required key \"%q\"", fmt.Sprintf("%s/%s", defaults.ImageRegistryOperatorNamespace, defaults.ImageRegistryPrivateConfigurationUser), envRegistryStorageOssAccessKeySecret)
-		}
-
-		d.credentials = &AlibabaCloudCredentials{
-			accessKeyID:     accessKeyID,
-			accessKeySecret: accessKeySecret,
-		}
-
-		return nil
 	}
+
+	if sec == nil {
+		return fmt.Errorf("unable to get secret %q: %v", fmt.Sprintf("%s/%s", defaults.ImageRegistryOperatorNamespace, defaults.CloudCredentialsName), err)
+	}
+	credential, err := fetchCredentialsIniFromSecret(sec)
+	if err != nil {
+		return fmt.Errorf("failed to generate shared secrets data: %v", err)
+	}
+	// This must be an AccessKeyCrential because the oss.New requires accessKeyID and accessSecretKey
+	d.credentials = credential.(*credentials.AccessKeyCredential)
+
+	return nil
 }
 
 // getOSSRegion returns an region that allows Docker Registry to access Alibaba Cloud OSS service
@@ -176,7 +194,7 @@ func (d *driver) getOSSService() (*oss.Client, error) {
 	}
 
 	endpoint := d.getOSSEndpoint()
-	client, err := oss.New(endpoint, d.credentials.accessKeyID, d.credentials.accessKeySecret)
+	client, err := oss.New(endpoint, d.credentials.AccessKeyId, d.credentials.AccessKeySecret)
 	if err != nil {
 		return nil, err
 	}
@@ -206,8 +224,8 @@ func (d *driver) ConfigEnv() (envs envvar.List, err error) {
 		envvar.EnvVar{Name: envRegistryStorageOssRegion, Value: d.getOSSRegion()},
 		envvar.EnvVar{Name: envRegistryStorageOssEncrypt, Value: true},
 		envvar.EnvVar{Name: envRegistryStorageOssInternal, Value: d.Config.Internal},
-		envvar.EnvVar{Name: envRegistryStorageOssAccessKeyId, Value: d.credentials.accessKeyID},
-		envvar.EnvVar{Name: envRegistryStorageOssAccessKeySecret, Value: d.credentials.accessKeySecret},
+		envvar.EnvVar{Name: envRegistryStorageOssAccessKeyId, Value: d.credentials.AccessKeyId},
+		envvar.EnvVar{Name: envRegistryStorageOssAccessKeySecret, Value: d.credentials.AccessKeySecret},
 	)
 
 	return
@@ -261,13 +279,13 @@ func (d *driver) VolumeSecrets() (map[string]string, error) {
 }
 
 func (d *driver) sharedCredentialsDataFromStaticCreds() ([]byte, error) {
-	if d.credentials == nil || d.credentials.accessKeyID == "" || d.credentials.accessKeySecret == "" {
+	if d.credentials == nil || d.credentials.AccessKeyId == "" || d.credentials.AccessKeySecret == "" {
 		return []byte{}, fmt.Errorf("invalid credentials for Alibaba Cloud")
 	}
 	buf := &bytes.Buffer{}
 	fmt.Fprint(buf, "[default]\n")
-	fmt.Fprintf(buf, "alibabacloud_access_key_id = %s\n", d.credentials.accessKeyID)
-	fmt.Fprintf(buf, "alibabacloud_secret_access_key = %s\n", d.credentials.accessKeySecret)
+	fmt.Fprintf(buf, "access_key_id = %s\n", d.credentials.AccessKeyId)
+	fmt.Fprintf(buf, "access_key_secret = %s\n", d.credentials.AccessKeySecret)
 
 	return buf.Bytes(), nil
 }
